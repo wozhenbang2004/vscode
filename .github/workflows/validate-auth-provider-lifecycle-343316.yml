@@ -115,7 +115,7 @@ jobs:
            				changed: event.changed?.map(reviveAuthenticationSession)
           --- a/src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
           +++ b/src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
-          @@ -4,15 +4,26 @@
+          @@ -4,15 +4,27 @@
             *--------------------------------------------------------------------------------------------*/
            
            import assert from 'assert';
@@ -129,12 +129,14 @@ jobs:
           +import { TestEnvironmentService } from '../../../test/browser/workbenchTestServices.js';
           +import { TestExtensionService, TestProductService, TestStorageService } from '../../../test/common/workbenchTestServices.js';
           +import { NullLogService } from '../../../../platform/log/common/log.js';
+          +import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
           +import { ExtHostAuthenticationShape } from '../../common/extHost.protocol.js';
            import { URI, UriComponents } from '../../../../base/common/uri.js';
            import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
-           import { AuthenticationSession } from '../../../services/authentication/common/authentication.js';
+          -import { AuthenticationSession } from '../../../services/authentication/common/authentication.js';
           -import { Dto } from '../../../services/extensions/common/proxyIdentifier.js';
           -import { reviveAuthenticationSession } from '../../browser/mainThreadAuthentication.js';
+          +import { AuthenticationSession, IAuthenticationExtensionsService } from '../../../services/authentication/common/authentication.js';
           +import { Dto, Proxied } from '../../../services/extensions/common/proxyIdentifier.js';
           +import { MainThreadAuthentication, reviveAuthenticationSession } from '../../browser/mainThreadAuthentication.js';
            
@@ -145,7 +147,7 @@ jobs:
            
            	const iconComponents: UriComponents = { scheme: 'https', authority: 'example.com', path: '/avatar.png', query: '', fragment: '' };
            
-          @@ -42,4 +53,143 @@
+          @@ -42,4 +54,143 @@
            			]
            		);
            	});
@@ -183,9 +185,9 @@ jobs:
           +			});
           +			const mainThread = disposables.add(new MainThreadAuthentication(
           +				context, TestProductService, authenticationService,
-          +				upcastPartial({ onDidChangeAccountPreference: Event.None }),
+          +				upcastPartial<IAuthenticationExtensionsService>({ onDidChangeAccountPreference: Event.None }),
           +				undefined!, undefined!, undefined!, undefined!, undefined!,
-          +				upcastPartial({ publicLog2: () => { } }), undefined!, new NullLogService(), undefined!,
+          +				upcastPartial<ITelemetryService>({ publicLog2: () => { } }), undefined!, new NullLogService(), undefined!,
           +				dynamicStorage, undefined!, undefined!, undefined!, undefined!
           +			));
           +			return {
@@ -290,7 +292,7 @@ jobs:
           +
            });
           PATCH
-          echo 'a199367420e5e83c3b2cd48d9783f7ee94fb84a851d3ab408530923e916368fe  '"$RUNNER_TEMP/auth-provider-lifecycle.patch" | sha256sum -c -
+          echo '21f21d023d49acc0799d90af9b0593fe8966a404fd7f5cac0d23506c5c1ca018  '"$RUNNER_TEMP/auth-provider-lifecycle.patch" | sha256sum -c -
           git apply --check "$RUNNER_TEMP/auth-provider-lifecycle.patch"
           git apply "$RUNNER_TEMP/auth-provider-lifecycle.patch"
           git diff --check
@@ -301,7 +303,7 @@ jobs:
           GIT_AUTHOR_DATE=2026-10-30T00:00:00Z GIT_COMMITTER_DATE=2026-10-30T00:00:00Z \
             git -c user.name=Validation -c user.email=validation@localhost commit -m 'Validate authentication provider lifecycle regression'
           {
-            printf 'Workflow commit: %s\nBaseline: %s\nPatch SHA256: a199367420e5e83c3b2cd48d9783f7ee94fb84a851d3ab408530923e916368fe\n' "$GITHUB_SHA" "$BASE_SHA"
+            printf 'Workflow commit: %s\nBaseline: %s\nPatch SHA256: 21f21d023d49acc0799d90af9b0593fe8966a404fd7f5cac0d23506c5c1ca018\n' "$GITHUB_SHA" "$BASE_SHA"
             git log -1 --format='Test source commit: %H'
             git diff "$BASE_SHA" HEAD --stat
             sha256sum src/vs/workbench/api/browser/mainThreadAuthentication.ts src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
