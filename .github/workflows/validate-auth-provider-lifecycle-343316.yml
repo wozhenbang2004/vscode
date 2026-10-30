@@ -1,0 +1,440 @@
+# Fork-only verification; this file is NOT part of the upstream pull request.
+name: Validate authentication provider lifecycle 343316
+
+on:
+  push:
+    branches: [validation/auth-provider-lifecycle-343316]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-auth-provider-lifecycle-343316
+  cancel-in-progress: false
+
+jobs:
+  official-client-and-electron:
+    if: github.repository == 'wozhenbang2004/vscode'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASE_SHA: cd2259bdf72ec7421e70ae80999ceb46f8bd86fe
+      NODE_OPTIONS: --max-old-space-size=8192
+      VSCODE_ARCH: x64
+      npm_config_arch: x64
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Check out the fixed upstream baseline, not a moving branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, same as upstream
+        with:
+          repository: microsoft/vscode
+          ref: cd2259bdf72ec7421e70ae80999ceb46f8bd86fe
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: false
+
+      - name: Verify baseline and apply the exact reviewed patch
+        run: |
+          mkdir -p validation-logs
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git hash-object src/vs/workbench/api/browser/mainThreadAuthentication.ts)" = 6aaccb13dbb2bc9d873e11c8aaaba9756bdcc28a
+          test "$(git hash-object src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts)" = 91977349c86254e9facef315915d6796a674cb61
+          cat > "$RUNNER_TEMP/auth-provider-lifecycle.patch" <<'PATCH'
+          --- a/src/vs/workbench/api/browser/mainThreadAuthentication.ts
+          +++ b/src/vs/workbench/api/browser/mainThreadAuthentication.ts
+          @@ -132,7 +132,7 @@
+           export class MainThreadAuthentication extends Disposable implements MainThreadAuthenticationShape {
+           	private readonly _proxy: Proxied<ExtHostAuthenticationShape>;
+           
+          -	private readonly _registrations = this._register(new DisposableMap<string>());
+          +	private readonly _registrations = this._register(new DisposableMap<string, { emitter: Emitter<AuthenticationSessionsChangeEvent>; dispose(): void }>());
+           	private _sentProviderUsageEvents = new Set<string>();
+           	private _suppressUnregisterEvent = false;
+           
+          @@ -237,6 +237,11 @@
+           		}));
+           	}
+           
+          +	override dispose(): void {
+          +		this._suppressUnregisterEvent = true;
+          +		super.dispose();
+          +	}
+          +
+           	async $registerAuthenticationProvider({ id, label, supportsMultipleAccounts, resourceServer, supportedAuthorizationServers, supportsChallenges }: IRegisterAuthenticationProviderDetails): Promise<void> {
+           		if (!this.authenticationService.declaredProviders.find(p => p.id === id)) {
+           			// If telemetry shows that this is not happening much, we can instead throw an error here.
+          @@ -249,7 +254,6 @@
+           			this.telemetryService.publicLog2<{ id: string }, AuthProviderNotDeclaredClassification>('authentication.providerNotDeclared', { id });
+           		}
+           		const emitter = new Emitter<AuthenticationSessionsChangeEvent>();
+          -		this._registrations.set(id, emitter);
+           		const supportedAuthorizationServerUris = (supportedAuthorizationServers ?? []).map(i => URI.revive(i));
+           		const provider =
+           			supportsChallenges
+          @@ -272,14 +276,22 @@
+           					emitter
+           				);
+           		this.authenticationService.registerAuthenticationProvider(id, provider);
+          +		this._registrations.set(id, {
+          +			emitter,
+          +			dispose: () => {
+          +				emitter.dispose();
+          +				if (this.authenticationService.isAuthenticationProviderRegistered(id) && this.authenticationService.getProvider(id) === provider) {
+          +					this.authenticationService.unregisterAuthenticationProvider(id);
+          +				}
+          +			}
+          +		});
+           	}
+           
+           	async $unregisterAuthenticationProvider(id: string): Promise<void> {
+          -		this._registrations.deleteAndDispose(id);
+           		// The ext host side already unregisters the provider, so we can suppress the event here.
+           		this._suppressUnregisterEvent = true;
+           		try {
+          -			this.authenticationService.unregisterAuthenticationProvider(id);
+          +			this._registrations.deleteAndDispose(id);
+           		} finally {
+           			this._suppressUnregisterEvent = false;
+           		}
+          @@ -292,9 +304,9 @@
+           	}
+           
+           	async $sendDidChangeSessions(providerId: string, event: Dto<AuthenticationSessionsChangeEvent>): Promise<void> {
+          -		const obj = this._registrations.get(providerId);
+          -		if (obj instanceof Emitter) {
+          -			obj.fire({
+          +		const registration = this._registrations.get(providerId);
+          +		if (registration) {
+          +			registration.emitter.fire({
+           				added: event.added?.map(reviveAuthenticationSession),
+           				removed: event.removed?.map(reviveAuthenticationSession),
+           				changed: event.changed?.map(reviveAuthenticationSession)
+          --- a/src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
+          +++ b/src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
+          @@ -4,15 +4,26 @@
+            *--------------------------------------------------------------------------------------------*/
+           
+           import assert from 'assert';
+          +import { Event } from '../../../../base/common/event.js';
+          +import { upcastPartial } from '../../../../base/test/common/mock.js';
+          +import { AuthenticationAccessService } from '../../../services/authentication/browser/authenticationAccessService.js';
+          +import { AuthenticationService } from '../../../services/authentication/browser/authenticationService.js';
+          +import { IDynamicAuthenticationProviderStorageService } from '../../../services/authentication/common/dynamicAuthenticationProviderStorage.js';
+          +import { IExtHostContext } from '../../../services/extensions/common/extHostCustomers.js';
+          +import { ExtensionHostKind } from '../../../services/extensions/common/extensionHostKind.js';
+          +import { TestEnvironmentService } from '../../../test/browser/workbenchTestServices.js';
+          +import { TestExtensionService, TestProductService, TestStorageService } from '../../../test/common/workbenchTestServices.js';
+          +import { NullLogService } from '../../../../platform/log/common/log.js';
+          +import { ExtHostAuthenticationShape } from '../../common/extHost.protocol.js';
+           import { URI, UriComponents } from '../../../../base/common/uri.js';
+           import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+           import { AuthenticationSession } from '../../../services/authentication/common/authentication.js';
+          -import { Dto } from '../../../services/extensions/common/proxyIdentifier.js';
+          -import { reviveAuthenticationSession } from '../../browser/mainThreadAuthentication.js';
+          +import { Dto, Proxied } from '../../../services/extensions/common/proxyIdentifier.js';
+          +import { MainThreadAuthentication, reviveAuthenticationSession } from '../../browser/mainThreadAuthentication.js';
+           
+           suite('MainThreadAuthentication', () => {
+           
+          -	ensureNoDisposablesAreLeakedInTestSuite();
+          +	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+           
+           	const iconComponents: UriComponents = { scheme: 'https', authority: 'example.com', path: '/avatar.png', query: '', fragment: '' };
+           
+          @@ -42,4 +53,143 @@
+           			]
+           		);
+           	});
+          +
+          +	suite('provider lifecycle', () => {
+          +		const authorizationServer = URI.parse('https://auth.example.com');
+          +		const resourceServer = URI.parse('https://mcp.example.com');
+          +		let authenticationService: AuthenticationService;
+          +
+          +		setup(() => {
+          +			const storageService = disposables.add(new TestStorageService());
+          +			const accessService = disposables.add(new AuthenticationAccessService(storageService, TestProductService));
+          +			authenticationService = disposables.add(new AuthenticationService(new TestExtensionService(), accessService, TestEnvironmentService, new NullLogService()));
+          +		});
+          +
+          +		function createHost(sessionId: string) {
+          +			const unregistered: string[] = [];
+          +			let clientRegistrationWrites = 0;
+          +			let stopped = false;
+          +			const proxy = upcastPartial<Proxied<ExtHostAuthenticationShape>>({
+          +				$onDidChangeAuthenticationSessions: async () => { },
+          +				$onDidUnregisterAuthenticationProvider: async id => { unregistered.push(id); },
+          +				$getSessions: async () => {
+          +					assert.strictEqual(stopped, false, 'must not use the stopped extension host');
+          +					return [{ id: sessionId, accessToken: 'test-token', scopes: [], account: { id: 'account', label: 'Account' } }];
+          +				}
+          +			});
+          +			const context = upcastPartial<IExtHostContext>({
+          +				getProxy: <T>() => proxy as unknown as Proxied<T>,
+          +				extensionHostKind: ExtensionHostKind.LocalProcess
+          +			});
+          +			const dynamicStorage = upcastPartial<IDynamicAuthenticationProviderStorageService>({
+          +				onDidChangeTokens: Event.None,
+          +				storeClientRegistration: async () => { clientRegistrationWrites++; }
+          +			});
+          +			const mainThread = disposables.add(new MainThreadAuthentication(
+          +				context, TestProductService, authenticationService,
+          +				upcastPartial({ onDidChangeAccountPreference: Event.None }),
+          +				undefined!, undefined!, undefined!, undefined!, undefined!,
+          +				upcastPartial({ publicLog2: () => { } }), undefined!, new NullLogService(), undefined!,
+          +				dynamicStorage, undefined!, undefined!, undefined!, undefined!
+          +			));
+          +			return {
+          +				mainThread, unregistered,
+          +				get clientRegistrationWrites() { return clientRegistrationWrites; },
+          +				stop: () => { stopped = true; mainThread.dispose(); }
+          +			};
+          +		}
+          +
+          +		function registerDynamicProvider(host: ReturnType<typeof createHost>, id = 'dynamic-provider') {
+          +			return host.mainThread.$registerDynamicAuthenticationProvider({
+          +				id, label: id, supportsMultipleAccounts: true, clientId: 'test-client',
+          +				authorizationServer: authorizationServer.toJSON(), resourceServer: resourceServer.toJSON()
+          +			});
+          +		}
+          +
+          +		test('removes host-owned dynamic providers without changing persisted registration', async () => {
+          +			const host = createHost('first-host');
+          +			await registerDynamicProvider(host);
+          +			assert.strictEqual(await authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer), 'dynamic-provider');
+          +			host.stop();
+          +			assert.strictEqual(authenticationService.isAuthenticationProviderRegistered('dynamic-provider'), false);
+          +			assert.strictEqual(await authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer), undefined);
+          +			assert.strictEqual(host.clientRegistrationWrites, 1);
+          +			assert.deepStrictEqual(host.unregistered, []);
+          +		});
+          +
+          +		test('rediscovers the provider on a replacement host instead of reusing the stopped RPC', async () => {
+          +			const first = createHost('first-host');
+          +			await registerDynamicProvider(first);
+          +			first.stop();
+          +			const second = createHost('second-host');
+          +			if (!await authenticationService.getOrActivateProviderIdForServer(authorizationServer, resourceServer)) {
+          +				await registerDynamicProvider(second);
+          +			}
+          +			assert.strictEqual((await authenticationService.getSessions('dynamic-provider'))[0].id, 'second-host');
+          +		});
+          +
+          +		test('keeps another host provider when one host is disposed', async () => {
+          +			const first = createHost('first-host');
+          +			const second = createHost('second-host');
+          +			await registerDynamicProvider(first, 'first-provider');
+          +			await registerDynamicProvider(second, 'second-provider');
+          +			first.stop();
+          +			assert.strictEqual(authenticationService.isAuthenticationProviderRegistered('first-provider'), false);
+          +			assert.strictEqual((await authenticationService.getSessions('second-provider'))[0].id, 'second-host');
+          +			assert.deepStrictEqual(second.unregistered, ['first-provider']);
+          +		});
+          +
+          +		test('old-host disposal preserves a replacement with the same id', async () => {
+          +			const first = createHost('first-host');
+          +			const second = createHost('second-host');
+          +			await registerDynamicProvider(first);
+          +			authenticationService.unregisterAuthenticationProvider('dynamic-provider');
+          +			await registerDynamicProvider(second);
+          +			first.stop();
+          +			assert.strictEqual(authenticationService.isAuthenticationProviderRegistered('dynamic-provider'), true);
+          +			assert.strictEqual((await authenticationService.getSessions('dynamic-provider'))[0].id, 'second-host');
+          +			assert.deepStrictEqual(second.unregistered, ['dynamic-provider']);
+          +		});
+          +
+          +		test('old-host late unregister preserves a replacement with the same id', async () => {
+          +			const first = createHost('first-host');
+          +			const second = createHost('second-host');
+          +			await registerDynamicProvider(first);
+          +			authenticationService.unregisterAuthenticationProvider('dynamic-provider');
+          +			await registerDynamicProvider(second);
+          +			await first.mainThread.$unregisterAuthenticationProvider('dynamic-provider');
+          +			first.stop();
+          +			assert.strictEqual(authenticationService.isAuthenticationProviderRegistered('dynamic-provider'), true);
+          +			assert.strictEqual((await authenticationService.getSessions('dynamic-provider'))[0].id, 'second-host');
+          +			assert.deepStrictEqual(second.unregistered, ['dynamic-provider']);
+          +		});
+          +
+          +		test('explicit unregister and re-register produce exactly one removal each', async () => {
+          +			const owner = createHost('owner');
+          +			const observer = createHost('observer');
+          +			const events: string[] = [];
+          +			disposables.add(authenticationService.onDidRegisterAuthenticationProvider(() => events.push('register')));
+          +			disposables.add(authenticationService.onDidUnregisterAuthenticationProvider(() => events.push('unregister')));
+          +			await registerDynamicProvider(owner);
+          +			await owner.mainThread.$unregisterAuthenticationProvider('dynamic-provider');
+          +			assert.deepStrictEqual(owner.unregistered, []);
+          +			await registerDynamicProvider(owner);
+          +			owner.stop();
+          +			assert.deepStrictEqual(events, ['register', 'unregister', 'register', 'unregister']);
+          +			assert.deepStrictEqual(observer.unregistered, ['dynamic-provider', 'dynamic-provider']);
+          +		});
+          +
+          +		test('same-host replacement continues forwarding session events', async () => {
+          +			const owner = createHost('owner');
+          +			await registerDynamicProvider(owner);
+          +			const previous = authenticationService.getProvider('dynamic-provider');
+          +			await registerDynamicProvider(owner);
+          +			assert.notStrictEqual(authenticationService.getProvider('dynamic-provider'), previous);
+          +			let changes = 0;
+          +			disposables.add(authenticationService.onDidChangeSessions(() => changes++));
+          +			await owner.mainThread.$sendDidChangeSessions('dynamic-provider', { added: [], changed: [], removed: [] });
+          +			assert.strictEqual(changes, 1);
+          +		});
+          +	});
+          +
+           });
+          PATCH
+          echo 'a199367420e5e83c3b2cd48d9783f7ee94fb84a851d3ab408530923e916368fe  '"$RUNNER_TEMP/auth-provider-lifecycle.patch" | sha256sum -c -
+          git apply --check "$RUNNER_TEMP/auth-provider-lifecycle.patch"
+          git apply "$RUNNER_TEMP/auth-provider-lifecycle.patch"
+          git diff --check
+          test "$(git diff --name-only | wc -l)" -eq 2
+          # A local-only commit lets the official changed-since hygiene check see the patch.
+          # Nothing is pushed, and checkout has not persisted credentials.
+          git add src/vs/workbench/api/browser/mainThreadAuthentication.ts src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
+          GIT_AUTHOR_DATE=2026-10-30T00:00:00Z GIT_COMMITTER_DATE=2026-10-30T00:00:00Z \
+            git -c user.name=Validation -c user.email=validation@localhost commit -m 'Validate authentication provider lifecycle regression'
+          {
+            printf 'Workflow commit: %s\nBaseline: %s\nPatch SHA256: a199367420e5e83c3b2cd48d9783f7ee94fb84a851d3ab408530923e916368fe\n' "$GITHUB_SHA" "$BASE_SHA"
+            git log -1 --format='Test source commit: %H'
+            git diff "$BASE_SHA" HEAD --stat
+            sha256sum src/vs/workbench/api/browser/mainThreadAuthentication.ts src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
+            df -h .
+            free -h
+          } | tee validation-logs/source-identity.log
+
+      - name: Use the repository's exact Node version
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0, same as upstream
+        with:
+          node-version-file: .nvmrc
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install Linux build and Electron runtime dependencies
+        run: |
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get update
+          ./build/azure-pipelines/linux/apt-retry.sh sudo apt-get install -y \
+            build-essential pkg-config libx11-dev libx11-xcb-dev libxkbfile-dev \
+            libnotify-bin libkrb5-dev xvfb xauth libgtk-3-0 libgbm1 libasound2t64
+          node --version | tee validation-logs/node-version.log
+          npm --version | tee validation-logs/npm-version.log
+
+      - name: Install lockfile dependencies with the official Linux native toolchain
+        timeout-minutes: 45
+        run: |
+          npm ci --prefix build 2>&1 | tee validation-logs/install-build.log
+          # Match upstream Linux CI's Electron-native-module compiler setup.
+          source ./build/azure-pipelines/linux/setup-env.sh
+          node build/npm/preinstall.ts 2>&1 | tee validation-logs/prepare-headers.log
+          npm ci 2>&1 | tee validation-logs/install.log
+          node build/npm/electronTypes.ts 2>&1 | tee validation-logs/electron-types.log
+
+      - name: Run official changed-file hygiene and ESLint
+        run: |
+          npm run hygiene -- --changed-since "$BASE_SHA" 2>&1 | tee validation-logs/hygiene.log
+          npm run eslint -- --changed-since "$BASE_SHA" 2>&1 | tee validation-logs/eslint.log
+
+      - name: Run official client typecheck
+        run: npm run typecheck-client 2>&1 | tee validation-logs/typecheck-client.log
+
+      - name: Transpile the client with the official Linux CI task
+        run: npm run gulp transpile-client-esbuild 2>&1 | tee validation-logs/transpile-client.log
+
+      - name: Download and verify the repository-pinned Electron
+        run: npm run electron -- x64 2>&1 | tee validation-logs/electron-setup.log
+
+      # No DOM stubs or custom harness. These are the repository's Electron/Mocha runners.
+      # --no-sandbox applies only to these isolated CI test processes; no host sysctl changes.
+      - name: Run MainThreadAuthentication through the official Electron runner
+        timeout-minutes: 10
+        env:
+          VSCODE_SKIP_PRELAUNCH: '1'
+        run: |
+          xvfb-run -a ./scripts/test.sh --no-sandbox --disable-gpu \
+            --tfs 'Auth main thread' \
+            --run src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts \
+            2>&1 | tee validation-logs/main-thread-authentication.log
+
+      - name: Run AuthenticationService through the official Electron runner
+        timeout-minutes: 10
+        env:
+          VSCODE_SKIP_PRELAUNCH: '1'
+        run: |
+          xvfb-run -a ./scripts/test.sh --no-sandbox --disable-gpu \
+            --tfs 'Auth service' \
+            --run src/vs/workbench/services/authentication/test/browser/authenticationService.test.ts \
+            2>&1 | tee validation-logs/authentication-service.log
+
+      - name: Assert both suites actually executed and passed
+        run: |
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          expected = {
+              'linux-x64-auth-main-thread-results.xml': [
+                  'revives session URIs and preserves optional session fields',
+                  'removes host-owned dynamic providers without changing persisted registration',
+                  'rediscovers the provider on a replacement host instead of reusing the stopped RPC',
+                  'keeps another host provider when one host is disposed',
+                  'old-host disposal preserves a replacement with the same id',
+                  'old-host late unregister preserves a replacement with the same id',
+                  'explicit unregister and re-register produce exactly one removal each',
+                  'same-host replacement continues forwarding session events',
+              ],
+              'linux-x64-auth-service-results.xml': [
+                  'registerDeclaredAuthenticationProvider',
+                  'unregisterDeclaredAuthenticationProvider',
+                  'isAuthenticationProviderRegistered',
+                  'unregisterAuthenticationProvider',
+                  'getProviderIds',
+                  'getProvider',
+                  'getOrActivateProviderIdForServer - should return undefined when no provider matches the authorization server',
+                  'getOrActivateProviderIdForServer - should return provider id if authorizationServerGlobs matches and authorizationServers match',
+                  'getOrActivateProviderIdForServer - should return undefined if authorizationServerGlobs match but authorizationServers do not match',
+                  'getOrActivateProviderIdForAuthorizationServer - should check multiple providers and return the first match',
+                  'getOrActivateProviderIdForServer - should match when resourceServer matches provider resourceServer',
+                  'getOrActivateProviderIdForServer - should not match when resourceServer does not match provider resourceServer',
+                  'getOrActivateProviderIdForServer - should match when provider has no resourceServer and resourceServer is provided',
+                  'getOrActivateProviderIdForServer - should match when provider has resourceServer but no resourceServer is provided',
+                  'getOrActivateProviderIdForServer - should distinguish between providers with same authorization server but different resource servers',
+                  'getSessions - base case',
+                  'getSessions - authorization server is not registered',
+                  'createSession',
+                  'getSessions - forwards resource option to provider',
+                  'createSession - forwards resource option to provider',
+                  'removeSession',
+                  'onDidChangeSessions',
+                  'should resolve when provider registers even if activateByEvent never resolves (#315841)',
+                  'should resolve when activateByEvent completes and provider is already registered',
+              ],
+          }
+          for pattern, names in expected.items():
+              path = Path('test-results') / pattern
+              root = ET.parse(path).getroot()
+              cases = root.findall('.//testcase')
+              assert len(cases) >= len(names), (path, len(cases), len(names))
+              actual = [case.get('name', '') for case in cases]
+              for name in names:
+                  assert any(value == name or value.endswith(' ' + name) for value in actual), (path, 'missing test', name)
+              assert not root.findall('.//failure'), path
+              assert not root.findall('.//error'), path
+              assert not root.findall('.//skipped'), path
+              print(f'{path}: {len(cases)} tests, no failures/errors/skips')
+          PYTEST
+
+      - name: Preserve actual logs and JUnit results even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, same as upstream
+        with:
+          name: vscode-343316-official-validation-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            validation-logs/
+            test-results/
