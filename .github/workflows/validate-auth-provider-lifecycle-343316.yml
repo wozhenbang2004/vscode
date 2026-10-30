@@ -170,7 +170,7 @@ jobs:
            
            	const iconComponents: UriComponents = { scheme: 'https', authority: 'example.com', path: '/avatar.png', query: '', fragment: '' };
            
-          @@ -42,4 +57,205 @@
+          @@ -42,4 +57,204 @@
            			]
            		);
            	});
@@ -267,7 +267,6 @@ jobs:
           +				const registrationSent = new DeferredPromise<void>();
           +				const acceptRegistration = new DeferredPromise<void>();
           +				const registrationAccepted = new DeferredPromise<void>();
-          +				let extHost: ExtHostAuthentication;
           +				const second = createHost('second-host', {
           +					$getSessions: (id, scopes) => extHost.$getSessions(id, scopes, {}),
           +					$onDidUnregisterAuthenticationProvider: id => extHost.$onDidUnregisterAuthenticationProvider(id)
@@ -285,7 +284,7 @@ jobs:
           +					},
           +					$unregisterAuthenticationProvider: id => second.mainThread.$unregisterAuthenticationProvider(id)
           +				});
-          +				extHost = new ExtHostAuthentication(
+          +				const extHost: ExtHostAuthentication = new ExtHostAuthentication(
           +					upcastPartial<IExtHostRpcService>({ getProxy: <T>() => mainThreadProxy as unknown as Proxied<T> }),
           +					undefined!, undefined!, undefined!, undefined!, undefined!, new NullLogService()
           +				);
@@ -377,7 +376,7 @@ jobs:
           +
            });
           PATCH
-          echo '84595047148bcb17c14689574e13867532c2a6bec18b8eb467970d851da478f1  '"$RUNNER_TEMP/auth-provider-lifecycle.patch" | sha256sum -c -
+          echo '7ec24cb10c804fcd91767dfc5c7db5edc556280a0ef8831a9cf1d50edb61deed  '"$RUNNER_TEMP/auth-provider-lifecycle.patch" | sha256sum -c -
           git apply --check "$RUNNER_TEMP/auth-provider-lifecycle.patch"
           git apply "$RUNNER_TEMP/auth-provider-lifecycle.patch"
           git diff --check
@@ -388,7 +387,7 @@ jobs:
           GIT_AUTHOR_DATE=2026-10-30T00:00:00Z GIT_COMMITTER_DATE=2026-10-30T00:00:00Z \
             git -c user.name=Validation -c user.email=validation@localhost commit -m 'Validate authentication provider lifecycle regression'
           {
-            printf 'Workflow commit: %s\nBaseline: %s\nPatch SHA256: 84595047148bcb17c14689574e13867532c2a6bec18b8eb467970d851da478f1\n' "$GITHUB_SHA" "$BASE_SHA"
+            printf 'Workflow commit: %s\nBaseline: %s\nPatch SHA256: 7ec24cb10c804fcd91767dfc5c7db5edc556280a0ef8831a9cf1d50edb61deed\n' "$GITHUB_SHA" "$BASE_SHA"
             git log -1 --format='Test source commit: %H'
             git diff "$BASE_SHA" HEAD --stat
             sha256sum src/vs/workbench/api/browser/mainThreadAuthentication.ts src/vs/workbench/api/test/browser/mainThreadAuthentication.test.ts
