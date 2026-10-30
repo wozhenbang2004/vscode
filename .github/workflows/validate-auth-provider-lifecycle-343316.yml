@@ -22,7 +22,7 @@ jobs:
         shell: bash
     env:
       BASE_SHA: cd2259bdf72ec7421e70ae80999ceb46f8bd86fe
-      PR_SHA: dc98871603c1262ff962a3b23847f17cd8ec197a
+      PR_SHA: ecaef8a5b708092acb0dff35fc8ea3323aa81d5f
       NODE_OPTIONS: --max-old-space-size=8192
       VSCODE_ARCH: x64
       npm_config_arch: x64
@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, same as upstream
         with:
           repository: wozhenbang2004/vscode
-          ref: dc98871603c1262ff962a3b23847f17cd8ec197a
+          ref: ecaef8a5b708092acb0dff35fc8ea3323aa81d5f
           fetch-depth: 1
           lfs: true
           persist-credentials: false
